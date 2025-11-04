@@ -3,13 +3,13 @@ import os
 import csv
 import math
 
-TRAIN_PATH = "data/train/"
-VAL_PATH = "data/val/"
-
 class DataGenerator:
     def __init__(self):
-        os.makedirs(TRAIN_PATH, exist_ok=True)
-        os.makedirs(VAL_PATH, exist_ok=True)
+        self.TRAIN_PATH = "data/train/"
+        self.VAL_PATH = "data/val/"
+        os.makedirs(self.TRAIN_PATH, exist_ok=True)
+        os.makedirs(self.VAL_PATH, exist_ok=True)
+        self._MAX_N = (1 << 64) - 1
 
     # ---------------------------
     # Internal helpers
@@ -27,12 +27,8 @@ class DataGenerator:
         train_samples = all_samples[:split_idx]
         val_samples = all_samples[split_idx:]
 
-        train_file_path = os.path.join(TRAIN_PATH, f"{file_stem}.csv")
-        val_file_path = os.path.join(VAL_PATH, f"{file_stem}.csv")
-
-        # Ensure directories exist (robust for staticmethod usage)
-        os.makedirs(TRAIN_PATH, exist_ok=True)
-        os.makedirs(VAL_PATH, exist_ok=True)
+        train_file_path = os.path.join("data/train/", f"{file_stem}.csv")
+        val_file_path = os.path.join("data/val/", f"{file_stem}.csv")
 
         with open(train_file_path, 'w', newline='') as train_f:
             train_writer = csv.writer(train_f)
@@ -151,10 +147,10 @@ class DataGenerator:
     def divisible_by_k(k, num_samples, train_split=0.8):
         if k <= 0:
             raise ValueError("k must be positive integer > 0")
-        
-        train_file_path = os.path.join(TRAIN_PATH, f"div_by_{k}.csv")
-        val_file_path = os.path.join(VAL_PATH, f"div_by_{k}.csv")
-        
+
+        train_file_path = os.path.join("data/train/", f"div_by_{k}.csv")
+        val_file_path = os.path.join("data/val/", f"div_by_{k}.csv")
+
         # Generate equal positives and negatives
         max_n = (1 << 64) - 1  # 2^64 - 1
         positives = []
@@ -224,9 +220,8 @@ class DataGenerator:
         if t < 0 or t > 64:
             raise ValueError("t must satisfy 0 <= t <= 64")
         positives, negatives = [], []
-        max_n = DataGenerator._MAX_N
+        max_n = (1 << 64) - 1
         if t == 64:
-            # Only n=0 qualifies (2^64 divides 0 by convention of >=)
             for _ in range(math.ceil(num_samples / 2)):
                 positives.append((0, 1))
         else:
@@ -237,7 +232,7 @@ class DataGenerator:
                 positives.append((m * step, 1))
         for _ in range(math.ceil(num_samples / 2)):
             n = random.randint(0, max_n)
-            while DataGenerator._trailing_zeros(n) < t:
+            while DataGenerator._trailing_zeros(n) >= t:
                 n = random.randint(0, max_n)
             negatives.append((n, 0))
         DataGenerator._write_dataset(positives + negatives, f"tz_ge_{t}", train_split)
@@ -526,26 +521,19 @@ class DataGenerator:
 
     @staticmethod
     def leading_zeros_ge(lz: int, num_samples: int, train_split: float = 0.8):
-        if lz < 0 or lz > 64:
-            raise ValueError("lz must satisfy 0 <= lz <= 64")
+        if lz <= 0 or lz > 64:
+            raise ValueError("lz must be positive integer 1 <= lz <= 64")
         positives, negatives = [], []
-        max_n = DataGenerator._MAX_N
-        threshold = (1 << (64 - lz)) if lz < 64 else 1  # numbers < threshold qualify
-        # Positives
+        max_n = (1 << 64) - 1
+        threshold = 1 << (64 - lz) if lz < 64 else 1
         for _ in range(math.ceil(num_samples / 2)):
             if lz == 64:
                 n = 0
             else:
                 n = random.randint(0, threshold - 1)
             positives.append((n, 1))
-        # Negatives: numbers with fewer leading zeros
         for _ in range(math.ceil(num_samples / 2)):
-            if lz == 0:
-                # no negatives possible if condition always true; fall back to force condition false by impossible
-                # but to keep balance, pick numbers >= 0 and relabel 0; this case degenerates
-                n = random.randint(0, max_n)
-            else:
-                n = random.randint(threshold, max_n)
+            n = random.randint(threshold, max_n)
             negatives.append((n, 0))
         DataGenerator._write_dataset(positives + negatives, f"lz_ge_{lz}", train_split)
 

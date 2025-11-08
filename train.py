@@ -16,72 +16,74 @@ TRACE_DIR = os.path.join(H_DRIVE_BASE, "traces")
 TOKENIZED_DIR = os.path.join(H_DRIVE_BASE, "tokenized")
 CODEBOOK_PATH = os.path.join(H_DRIVE_BASE, "codebook.pt")
 
-MAX_SEQ_LEN = 512 
+MAX_SEQ_LEN = 4096 # fx graphs are much longer. You may need to tune this.
 
-FEATURE_DIM = 11
+FEATURE_DIM = 19   # We define this new 19-dim vector below
 
 os.makedirs(TOKENIZED_DIR, exist_ok=True)
 
-def build_sequence_from_trace(trace):
-    """
-    This is the new 'flatten_trace'.
-    It builds a *sequence* of feature vectors, one for each component.
-    """
+def get_shape_vec(shape_list, max_dims=4):
+    """Pads a shape list to a fixed length."""
+    shape_vec = shape_list + [0] * (max_dims - len(shape_list))
+    return shape_vec[:max_dims]
+
+def build_sequence_from_graph(trace):
+    """Build fx graph feature sequence."""
     sequence = []
 
-    # 1. Process Parameters
-    if 'params' in trace and 'parameters' in trace['params']:
-        for param_name, p in trace['params']['parameters'].items():
+    if 'graph' not in trace or 'params' not in trace:
+        return [([0] * FEATURE_DIM)]
+
+    param_stats = trace['params'].get('parameters', {})
+
+    for node in trace['graph']:
+        node_vec = [0] * FEATURE_DIM
+
+        op = node.get('op')
+        if op == 'placeholder':
+            node_vec[0] = 1
+        elif op == 'call_module':
+            node_vec[1] = 1
+        elif op == 'call_function':
+            node_vec[2] = 1
+        elif op == 'get_attr':
+            node_vec[3] = 1
+        elif op == 'output':
+            node_vec[4] = 1
+
+        target_str = str(node.get('target', ''))
+        node_vec[5] = hash(target_str) % 2000
+
+        if op == 'get_attr' and target_str in param_stats:
+            p = param_stats[target_str]
             stats = p.get('statistics', {})
             shape = p.get('shape', [])
-            
-            # Pad shape to 4 dimensions (e.g., [64] -> [64, 0, 0, 0])
-            shape_vec = shape + [0] * (4 - len(shape))
-            
-            # Normalize numel (log scale) to keep it in a reasonable range
-            numel = np.log10(p.get('numel', 1) + 1)
+            shape_vec = get_shape_vec(shape)
 
-            # Feature vector for this parameter
-            param_vec = [
-                stats.get('mean', 0.0),
-                stats.get('std', 0.0),
-                stats.get('min', 0.0),
-                stats.get('max', 0.0),
-                numel,
-                shape_vec[0],
-                shape_vec[1],
-                shape_vec[2],
-                shape_vec[3],
-                0, # 0 indicates this is a 'parameter' type
-                0  # 0 for depth
-            ]
-            sequence.append(param_vec)
+            node_vec[6] = np.log10(p.get('numel', 1) + 1)
+            node_vec[7] = stats.get('mean', 0.0)
+            node_vec[8] = stats.get('std', 0.0)
+            node_vec[9] = stats.get('min', 0.0)
+            node_vec[10] = stats.get('max', 0.0)
+            node_vec[11] = shape_vec[0]
+            node_vec[12] = shape_vec[1]
+            node_vec[13] = shape_vec[2]
+            node_vec[14] = shape_vec[3]
 
-    # 2. Process Hierarchy (Layers)
-    def recurse_hierarchy(node, depth=0):
-        if not node:
-            return
-        
-        # We only care about leaf nodes (actual layers)
-        if not node.get('children'):
-            # Feature vector for this layer
-            layer_vec = [
-                0, 0, 0, 0, 0, 0, 0, 0, 0, # 0s for param stats
-                hash(node.get('class', '')) % 2000, # Hash of class name
-                depth # Depth in the hierarchy
-            ]
-            sequence.append(layer_vec)
-        
-        for child in node.get('children', []):
-            recurse_hierarchy(child, depth + 1)
-            
-    if 'hierarchy' in trace:
-        recurse_hierarchy(trace['hierarchy'])
-    
+        tensor_meta = node.get('meta', {}).get('tensor', {})
+        out_shape = tensor_meta.get('shape', [])
+        out_shape_vec = get_shape_vec(out_shape)
+
+        node_vec[15] = out_shape_vec[0]
+        node_vec[16] = out_shape_vec[1]
+        node_vec[17] = out_shape_vec[2]
+        node_vec[18] = out_shape_vec[3]
+
+        sequence.append(node_vec)
+
     if not sequence:
-        # Handle empty or corrupt traces
-        return [([0] * FEATURE_DIM)] # Return a single zero'd vector
-        
+        return [([0] * FEATURE_DIM)]
+
     return sequence
 
 class ArchitectureDataset(Dataset):
@@ -101,8 +103,8 @@ class ArchitectureDataset(Dataset):
             # On corrupt file, just get the next one
             return self.__getitem__((idx + 1) % len(self))
         
-        # 1. Get the sequence of feature vectors (e.g., [780, 11])
-        sequence_vectors = build_sequence_from_trace(trace)
+        # 1. Get the sequence of feature vectors (e.g., [4096, 19])
+        sequence_vectors = build_sequence_from_graph(trace)
         
         # 2. Convert to tensor [L, F]
         tensor = torch.tensor(sequence_vectors, dtype=torch.float)
@@ -116,9 +118,9 @@ class ArchitectureDataset(Dataset):
             # Pad
             padding = torch.zeros(MAX_SEQ_LEN - current_len, FEATURE_DIM)
             tensor = torch.cat((tensor, padding), dim=0)
-            
+        
         # 4. Transpose to [F, L] for the VQ-VAE's Conv1d layers
-        # Final shape: [11, 512]
+        # Final shape: [19, 4096]
         tensor = tensor.T
         
         return tensor
@@ -140,7 +142,7 @@ def train_vqvae(dataset, epochs=20, batch_size=32, lr=1e-4, device='cuda', num_d
             if batch is None:
                 continue
             
-            # batch shape is [B, F, L] (e.g., [32, 11, 512])
+            # batch shape is [B, F, L] (e.g., [32, 19, 4096])
             batch = batch.to(device)
             
             recon, z, z_q, indices = model(batch)

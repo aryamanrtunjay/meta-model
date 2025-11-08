@@ -15,6 +15,8 @@ H_DRIVE_BASE = "H:\\meta-model-data"
 TRACE_DIR = os.path.join(H_DRIVE_BASE, "traces")
 TOKENIZED_DIR = os.path.join(H_DRIVE_BASE, "tokenized")
 CODEBOOK_PATH = os.path.join(H_DRIVE_BASE, "codebook.pt")
+VOCAB_PATH = os.path.join(H_DRIVE_BASE, "target_vocab.json")
+NORM_STATS_PATH = os.path.join(H_DRIVE_BASE, "norm_stats.pt")
 
 MAX_SEQ_LEN = 4096 # fx graphs are much longer. You may need to tune this.
 
@@ -22,12 +24,29 @@ FEATURE_DIM = 19   # We define this new 19-dim vector below
 
 os.makedirs(TOKENIZED_DIR, exist_ok=True)
 
+TARGET_VOCAB = None
+TARGET_VOCAB_SIZE = 0
+
+def load_target_vocab():
+    """Loads the target vocabulary mapping from disk."""
+    global TARGET_VOCAB, TARGET_VOCAB_SIZE
+    if TARGET_VOCAB is not None:
+        return TARGET_VOCAB
+    if not os.path.exists(VOCAB_PATH):
+        raise FileNotFoundError("Run preprocess.py to create target_vocab.json first!")
+    with open(VOCAB_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # Ensure keys remain strings and values integers
+    TARGET_VOCAB = {k: int(v) for k, v in data.items()}
+    TARGET_VOCAB_SIZE = max(len(TARGET_VOCAB), 1)
+    return TARGET_VOCAB
+
 def get_shape_vec(shape_list, max_dims=4):
     """Pads a shape list to a fixed length."""
     shape_vec = shape_list + [0] * (max_dims - len(shape_list))
     return shape_vec[:max_dims]
 
-def build_sequence_from_graph(trace):
+def build_sequence_from_graph(trace, target_vocab=None, vocab_size=None):
     """Build fx graph feature sequence."""
     sequence = []
 
@@ -35,6 +54,9 @@ def build_sequence_from_graph(trace):
         return [([0] * FEATURE_DIM)]
 
     param_stats = trace['params'].get('parameters', {})
+    vocab = target_vocab if target_vocab is not None else load_target_vocab()
+    size = vocab_size if vocab_size is not None else max(TARGET_VOCAB_SIZE, len(vocab))
+    denom = max(size - 1, 1)
 
     for node in trace['graph']:
         node_vec = [0] * FEATURE_DIM
@@ -52,7 +74,8 @@ def build_sequence_from_graph(trace):
             node_vec[4] = 1
 
         target_str = str(node.get('target', ''))
-        node_vec[5] = hash(target_str) % 2000
+        idx = vocab.get(target_str, 0)
+        node_vec[5] = idx / denom
 
         if op == 'get_attr' and target_str in param_stats:
             p = param_stats[target_str]
@@ -90,6 +113,15 @@ class ArchitectureDataset(Dataset):
     def __init__(self, trace_dir):
         self.trace_dir = trace_dir
         self.traces = [f for f in os.listdir(trace_dir) if f.endswith('.json')]
+        load_target_vocab()
+
+        if os.path.exists(NORM_STATS_PATH):
+            stats = torch.load(NORM_STATS_PATH, map_location='cpu')
+            self.min_vals = stats["min"].float().unsqueeze(0)
+            self.max_vals = stats["max"].float().unsqueeze(0)
+            self.range = (self.max_vals - self.min_vals) + 1e-6
+        else:
+            raise FileNotFoundError("Run preprocess.py to create norm_stats.pt first!")
     
     def __len__(self):
         return len(self.traces)
@@ -108,6 +140,8 @@ class ArchitectureDataset(Dataset):
         
         # 2. Convert to tensor [L, F]
         tensor = torch.tensor(sequence_vectors, dtype=torch.float)
+        tensor = (tensor - self.min_vals) / self.range
+        tensor = torch.clamp(tensor, 0.0, 1.0)
         
         # 3. Pad or Truncate sequence length (L)
         current_len = tensor.shape[0]
@@ -116,7 +150,7 @@ class ArchitectureDataset(Dataset):
             tensor = tensor[:MAX_SEQ_LEN, :]
         elif current_len < MAX_SEQ_LEN:
             # Pad
-            padding = torch.zeros(MAX_SEQ_LEN - current_len, FEATURE_DIM)
+            padding = torch.zeros(MAX_SEQ_LEN - current_len, FEATURE_DIM, dtype=torch.float)
             tensor = torch.cat((tensor, padding), dim=0)
         
         # 4. Transpose to [F, L] for the VQ-VAE's Conv1d layers
